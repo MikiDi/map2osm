@@ -1,78 +1,120 @@
 #!/usr/bin/python3
 
-import json
+import xml.etree.ElementTree as ET
 import time
-import logging
-logging.basicConfig(level=logging.INFO)
+import pprint
 
 import geojson
-import overpass
-api = overpass.API()
+import overpy
 
-_SEGMENTS_QUERY = "node(around:{},{},{})[rcn_ref={}];"
+import helpers, escape_helpers
 
-junctions_osm = geojson.FeatureCollection([])
+api = overpy.Overpass()
 
-for junction in junctions_wt["results"]["bindings"]:
-    perimeter = 10.0
-    q = _SEGMENTS_QUERY.format(perimeter,
-                           junction["lat"]["value"],
-                           junction["long"]["value"],
-                           junction["nummer"]["value"])
-    logging.debug(q)
-    try:
-        time.sleep(1)
-        response = api.Get(q)
-        print(response)
-        logging.info("found {} osm equivalents for {}".format(len(response["features"]),
-                                                              junction["junction"]["value"]))
-        for feature in response["features"]:
-            feature["properties"]["uri"] = junction["junction"]["value"]
-        junctions_osm["features"].extend(response["features"])
-    except overpass.OverpassError as e:
-        logging.warning("Something went wrong querying overpass:", e)
-        continue
+_SEGMENTS_SPARQL_QUERY = """
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX ost: <http://w3id.org/ost/ns#> #Open Standard for Tourism Ecosystems Data
+PREFIX dcterms: <http://purl.org/dc/terms/>
+PREFIX vcard: <http://www.w3.org/2006/vcard/ns#>
+PREFIX schema: <http://schema.org/>
+PREFIX gr:<http://purl.org/goodrelations/v1#> #GoodRelations
+PREFIX skos:<http://www.w3.org/2004/02/skos/core#> #SKOS Simple Knowledge Organization System
+PREFIX adms:<http://www.w3.org/ns/adms#> #Asset Description Metadata Schema
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT DISTINCT ((xsd:integer(STRAFTER(STR(?elem1), "List/"))) as ?n) ?elem1 ?junction1 ?junction2 ?connection ?junctionnr1 ?junctionnr2 ?lat ?long  WHERE {
+	{
+		select  ?route where {
+			?route a ost:NetworkBasedRoute .
+		}
+		LIMIT 1
+	}
+
+	#BIND
+	?route ost:trajectoryDescription ?desc. FILTER (STRENDS(str(?desc),"-reverse") = false)
+	?desc rdf:rest* ?elem1.
+	?elem1 rdf:first ?junction1.
+	?elem1 rdf:rest ?elem2.
+	?elem2 rdf:first ?junction2.
+	OPTIONAL{
+    	?connection ost:startJunction ?junction1.
+    	?connection ost:endJunction ?junction2.
+ 	}
+	?junction1 ost:belongsTo ?net.
+	#?net ost:recreationType ost:RECTCYCL. FILTER (NOT EXISTS {?net ost:recreationType ost:RECTWALK.}) #filter not working?
+	#?net gr:name "FNW 2.0"^^xsd:string.
+	?junction1 ost:number ?junctionnr1.
+	?junction1 <http://www.w3.org/ns/locn#location>/<http://www.w3.org/ns/locn#geometry> ?l.
+	?l <http://www.w3.org/2003/01/geo/wgs84_pos#lat> ?lat;
+		<http://www.w3.org/2003/01/geo/wgs84_pos#long> ?long.
+    ?junction2 ost:number ?junctionnr2.
+}
+ORDER BY ASC(?n)
+"""
+
+# junctions_osm = geojson.FeatureCollection([])
+#
+# for junction in junctions_wt["results"]["bindings"]:
+#     perimeter = 10.0
+#     q = _SEGMENTS_QUERY.format(perimeter,
+#                            junction["lat"]["value"],
+#                            junction["long"]["value"],
+#                            junction["nummer"]["value"])
 
 
-insert_query_form = """
+_INSERT_SPARQL_QUERY = """
 INSERT DATA {{
     GRAPH <{0}> {{
         <{1}> <{2}> {3}{4}.
     }}
 }}
 """
+_SEGMENTS_QUERY = """
+    relation
+    ["type"="route"]
+    ["route"="bicycle"]
+    ["network"="rcn"]
+    ["note"="{0}-{1}"]
+    (around:500.0, {2}, {3}) -> .traject_{4};
+    node["rcn_ref"="{0}"](> .traject_{4});
+    node["rcn_ref"="{1}"](> .traject_{4});"""
 
-select_query = os.getenv('URL_QUERY')
-# select_query = select_query_form.format(os.getenv("MU_APPLICATION_GRAPH"),
-#     os.getenv("SITE_PREDICATE"))
 
-try:
-    results = helpers.query(select_query)["results"]["bindings"]
-except Exception as e:
-    helpers.log("Querying SPARQL-endpoint failed:\n{}".format(e))
+# def query_segment(start, end, lat, lng, n):
 
-for result in results:
+def run():
     try:
-        url = result["url"]["value"]
-    except KeyError as e:
-        helpers.log('SPARQL query must contain "?url"')
-    # if url in urls: #check if url already has scraped text in store
-    #     continue
-    try:
-        helpers.log("Getting URL \"{}\"".format(url))
-        doc_before = scrape(url)
-        if  not doc_before: continue
-        doc_lang = get_lang(doc_before)
-        doc_after = cleanup(doc_before)
-        insert_query = insert_query_form.format(os.getenv('MU_APPLICATION_GRAPH'),
-            url, os.getenv('CONTENT_PREDICATE'),
-            escape_helpers.sparql_escape(doc_after),
-            '@'+doc_lang if doc_lang else '')
-        try:
-            helpers.update(insert_query)
-        except Exception as e:
-            helpers.log("Querying SPARQL-endpoint failed:\n{}".format(e))
-            continue
+        results = helpers.query(_SEGMENTS_SPARQL_QUERY)["results"]["bindings"]
     except Exception as e:
-        helpers.log("Something went wrong ...\n{}".format(str(e)))
-        continue
+        helpers.log("Querying SPARQL-endpoint failed:\n{}".format(e))
+
+    #Assemble overpass query
+    query = "[out:xml][timeout:400];\n("
+    for i in range(len(results)):
+        if i == 3: break
+        if results[i]["junctionnr1"]["value"] != results[i]["junctionnr2"]["value"]:
+            query += _SEGMENTS_QUERY.format(min(results[i]["junctionnr1"]["value"], results[i]["junctionnr2"]["value"]),
+                                            max(results[i]["junctionnr1"]["value"], results[i]["junctionnr2"]["value"]),
+                                            results[i]["lat"]["value"],
+                                            results[i]["long"]["value"],
+                                            i)
+    query += ");\nout body;"
+    #Run query
+    try:
+        helpers.log("Sending query: \n{}".format(query))
+        response = api.query(query)
+        helpers.log("Done querying")
+    except Exception as e:
+        helpers.log("Something went wrong while querying overpass...\n{}".format(str(e)))
+
+    #Assemble overpass query
+    query = "[out:xml][timeout:400];\n("
+    for result in results :
+        note = "{}-{}".format(result["junctionnr1"]["value"], result["junctionnr2"]["value"])
+        try:
+            segment = next((x for x in response.relations if x.tags["note"] == note), None)
+        except KeyError:
+            segment = None
+        helpers.log("Rel for segment {}: {}".format(result["n"]["value"], segment))
+    # root = ET.fromstring(country_data_as_string)
